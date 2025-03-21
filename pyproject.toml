@@ -38,6 +38,7 @@ dependencies = [
     "beartype>=0.19.0",
     "treescope>=0.1.7",
     "transformers==4.48.1",
+    "pymycobot==3.9.1"
 ]
 
 
@@ -58,7 +59,7 @@ dev = [
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/huggingface/lerobot", rev = "6674e368249472c91382eb54bb8501c94c7f0c56" }
+lerobot = { git = "https://github.com/yzzueong/LerobotMycobot" }
 
 [tool.uv.workspace]
 members = ["packages/*"]
