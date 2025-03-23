@@ -3,7 +3,7 @@ import functools
 import logging
 import platform
 from typing import Any
-
+from flax.core import freeze, unfreeze
 import etils.epath as epath
 import flax.nnx as nnx
 from flax.training import common_utils
@@ -200,12 +200,15 @@ def merge_lora_to_base(train_state):
 
             # 合并公式：W = W + LoRA_A @ LoRA_B
             base_weight_name = name.replace(".lora_a", "")
-            new_params[base_weight_name] = train_state.params[base_weight_name] + lora_A @ lora_B
+            new_params[base_weight_name] = jnp.asarray(
+                train_state.params[base_weight_name] + jnp.matmul(lora_A, lora_B),
+                dtype=train_state.params[base_weight_name].dtype  # 确保类型一致
+            )
         elif "lora_b" in name:
             continue  # 跳过 LoRA_B，它已经被合并
         else:
             new_params[name] = param  # 保留原始参数
-    return train_state.replace(params=new_params)
+    return train_state.replace(params=freeze(new_params))
 
 def remove_lora_adapters(train_state):
     new_params = {k: v for k, v in train_state.params.items() if "lora_" not in k}
@@ -260,6 +263,9 @@ def main(config: _config.TrainConfig):
     print("remove lora node completed....")
 
     _checkpoints.save_state(checkpoint_manager, train_state, data_loader, 0)
+    logging.info("Model Layers after merging LoRA:")
+    for layer_name in train_state.params.keys():
+        logging.info(layer_name)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
