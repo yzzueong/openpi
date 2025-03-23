@@ -253,9 +253,11 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-
+    print("resume completed....")
     train_state = merge_lora_to_base(train_state)
+    print("merge lora completed....")
     train_state = remove_lora_adapters(train_state)
+    print("remove lora node completed....")
 
     _checkpoints.save_state(checkpoint_manager, train_state, data_loader, 0)
 
