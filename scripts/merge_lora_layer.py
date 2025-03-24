@@ -25,6 +25,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.models.pi0 as pi0
 
 
 def init_logging():
@@ -190,29 +191,6 @@ def train_step(
     return new_state, info
 
 
-def merge_lora_to_base(train_state):
-    new_params = {}
-    for name, param in train_state.params.items():
-        if "lora_a" in name and name.replace("lora_a", "lora_b") in train_state.params:
-            # 获取 LoRA A 和 B
-            lora_A = param
-            lora_B = train_state.params[name.replace("lora_a", "lora_b")]
-
-            # 合并公式：W = W + LoRA_A @ LoRA_B
-            base_weight_name = name.replace(".lora_a", "")
-            new_params[base_weight_name] = jnp.asarray(
-                train_state.params[base_weight_name] + jnp.matmul(lora_A, lora_B),
-                dtype=train_state.params[base_weight_name].dtype  # 确保类型一致
-            )
-        elif "lora_b" in name:
-            continue  # 跳过 LoRA_B，它已经被合并
-        else:
-            new_params[name] = param  # 保留原始参数
-    return train_state.replace(params=freeze(new_params))
-
-def remove_lora_adapters(train_state):
-    new_params = {k: v for k, v in train_state.params.items() if "lora_" not in k}
-    return train_state.replace(params=new_params)
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -256,16 +234,105 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-    print("resume completed....")
-    train_state = merge_lora_to_base(train_state)
-    print("merge lora completed....")
-    train_state = remove_lora_adapters(train_state)
-    print("remove lora node completed....")
+    step = int(train_state.step)
 
-    _checkpoints.save_state(checkpoint_manager, train_state, data_loader, 0)
-    logging.info("Model Layers after merging LoRA:")
-    for layer_name in train_state.params.keys():
-        logging.info(layer_name)
+    def convert_to_base_model(train_state):
+        """convert lora model to base model"""
+        logging.info("Starting transform LoRA model to Base model...")
+        
+        # 1. switch train_state to dict
+        params_dict = train_state.params.to_pure_dict()
+        flattened = traverse_util.flatten_dict(params_dict)
+        converted = {}
+        
+        # 2. find all layers include lora
+        lora_layers = []
+        for path, value in flattened.items():
+            path_str = "/".join(str(p) for p in path)
+            if isinstance(value, (jnp.ndarray, jax.Array)):  # 直接检查数组类型
+                if "lora_A" in path_str or "lora_a" in path_str:
+                    logging.info(f"Find LoRA Layer: {path_str}")
+                    lora_layers.append(path)
+        
+        logging.info(f"Totally find {len(lora_layers)} LoRA Layers")
+        
+        # 3. process every lora layer
+        for i, lora_a_path in enumerate(lora_layers):
+            path_str = "/".join(str(p) for p in lora_a_path)
+            logging.info(f"processing {i+1}/{len(lora_layers)} LoRA Layer: {path_str}")
+            
+            # get lora layer and original layer
+            if "/mlp" not in path_str:
+                base_path = tuple(str(p).replace("lora_a", "w") if isinstance(p, str) else p for p in lora_a_path)
+                lora_b_path = tuple(str(p).replace("lora_a", "lora_b") if isinstance(p, str) else p for p in lora_a_path)
+            else:
+                base_path = tuple(str(p).replace("_lora_a", "") if isinstance(p, str) else p for p in lora_a_path)
+                lora_b_path = tuple(str(p).replace("lora_a", "lora_b") if isinstance(p, str) else p for p in lora_a_path)
+
+            # get weight
+            lora_a = flattened[lora_a_path]
+            lora_b = flattened[lora_b_path]
+            base_weight = flattened[base_path]
+
+            
+            # use bfloat16 to save memory
+            lora_a = lora_a.astype(jnp.bfloat16)
+            lora_b = lora_b.astype(jnp.bfloat16)
+
+            logging.info("cal merge weight...")
+            logging.info(f"lora_a shape {lora_a.shape}, dtype {lora_a.dtype}")
+            logging.info(f"lora_b shape {lora_b.shape}, dtype {lora_b.dtype}")
+            logging.info(f"w shape {base_weight.shape}, dtype {base_weight.dtype}")
+            
+            # merge lora to original layer
+            lora_weight = jnp.matmul(lora_a, lora_b)
+            merged_weight = base_weight + lora_weight.astype(base_weight.dtype)
+            logging.info(f"merged_weight shape {merged_weight.shape}, dtype {merged_weight.dtype}")
+            
+            # update weight
+            converted[base_path] = merged_weight
+            
+            # release variables
+            del lora_weight, merged_weight
+            jax.clear_caches()
+        
+        # 4. repeat non-lora weights
+        for path, value in flattened.items():
+            path_str = "/".join(str(p) for p in path)
+            if not any(x in path_str.lower() for x in ["lora_a", "lora_b", "lora_rank"]):
+                converted[path] = value
+        
+        # 5. convert dict back to PyTree format
+        converted_dict = traverse_util.unflatten_dict(converted)
+        converted_params = nnx.State(converted_dict)
+        
+        # 6. remove lora node in graph
+        def clean_graph(graph_def):
+            if isinstance(graph_def, dict):
+                cleaned = {k: v for k, v in graph_def.items() 
+                         if not any(lora_type in str(k).lower() 
+                                  for lora_type in ["lora_a", "lora_b", "lora_rank"])}
+                return {k: clean_graph(v) for k, v in cleaned.items()}
+            elif isinstance(graph_def, (list, tuple)):
+                return type(graph_def)(clean_graph(x) for x in graph_def)
+            else:
+                return graph_def
+        
+        cleaned_def = clean_graph(train_state.model_def)
+        
+        # 7. create new train_state
+        return dataclasses.replace(
+            train_state,
+            params=converted_params,
+            model_def=cleaned_def
+        )
+
+    # transform model
+    train_state = convert_to_base_model(train_state)
+    logging.info("Transformation Completed")
+    
+    # save model, index=step+1
+    _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step+1)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
