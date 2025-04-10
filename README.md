@@ -10,7 +10,7 @@ In this repo, it includes all my implementation of this process.
 When cloning this repo, make sure to update submodules:
 
 ```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
+git clone https://github.com/yzzueong/openpi.git
 
 # Or if you already cloned the repo:
 git submodule update --init --recursive
