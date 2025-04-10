@@ -12,7 +12,6 @@ When cloning this repo, make sure to update submodules:
 ```bash
 git clone https://github.com/yzzueong/openpi.git
 
-# Or if you already cloned the repo:
 git submodule update --init --recursive
 ```
 
